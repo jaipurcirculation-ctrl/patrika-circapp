@@ -1,0 +1,43 @@
+{
+  "name": "patrika-vitran-suite",
+  "version": "2.0.0",
+  "description": "Patrika Vitran Suite — circulation dashboard (Node.js/Express backend)",
+  "private": true,
+  "scripts": {
+    "start": "node api/server.js",
+    "dev": "nodemon api/server.js",
+    "serve-www": "node -e \"const h=require('http'),s=require('serve-static')('www'),f=require('finalhandler');h.createServer((q,r)=>s(q,r,f(q,r))).listen(8123,()=>console.log('Static: http://localhost:8123'))\"",
+    "import": "node api/import_excel_data.js",
+    "import:daily": "node api/import_excel_data.js --file daily",
+    "import:supply": "node api/import_excel_data.js --file supply",
+    "import:collection": "node api/import_excel_data.js --file collection",
+    "sync:oracle": "node api/oracle_sync.js",
+    "sync:oracle:bulk": "node api/oracle_bulk_sync.js",
+    "cap:init": "npx cap sync",
+    "android:add": "npx cap add android",
+    "android:open": "npx cap open android",
+    "android:run": "npx cap run android",
+    "ios:add": "npx cap add ios",
+    "ios:open": "npx cap open ios"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.1.0",
+    "@capacitor/core": "^6.1.0",
+    "@capacitor/ios": "^6.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^4.19.2",
+    "finalhandler": "^1.2.0",
+    "oracledb": "^6.10.0",
+    "pg": "^8.11.3",
+    "serve-static": "^1.15.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.0",
+    "nodemon": "^3.0.2"
+  },
+  "allowScripts": {
+    "oracledb@6.10.0": true
+  }
+}
