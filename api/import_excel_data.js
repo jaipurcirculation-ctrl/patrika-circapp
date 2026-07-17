@@ -1,17 +1,17 @@
 'use strict';
 
 const XLSX = require('xlsx');
-const { Client } = require('pg');
+const mysql = require('mysql2/promise');
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 // ─── DB config (read from .env) ───────────────────────────────────────────────
-const DB_CONFIG = {
-  host:     process.env.DB_HOST     || 'localhost',
-  port:     parseInt(process.env.DB_PORT || '5432', 10),
-  database: process.env.DB_NAME     || 'patrika_vitran',
-  user:     process.env.DB_USER     || 'postgres',
-  password: process.env.DB_PASSWORD || '',
+const MYSQL_CONFIG = {
+  host:     process.env.MYSQL_HOST     || 'localhost',
+  port:     parseInt(process.env.MYSQL_PORT || '3306', 10),
+  database: process.env.MYSQL_DB       || 'patrika_vitran',
+  user:     process.env.MYSQL_USER     || 'root',
+  password: process.env.MYSQL_PASSWORD || '',
 };
 
 // ─── Input directory (relative to this file → api/../Input Reports/) ─────────
@@ -113,22 +113,16 @@ function toTime(v) {
   return null;
 }
 
-// ─── Helper: parse interval → "HH:MM:SS" or "-HH:MM:SS" or null ─────────────
-function toInterval(v) {
+// ─── Helper: parse interval → signed integer seconds (for MySQL INT columns) ──
+function toIntervalSecs(v) {
   if (v === null || v === undefined) return null;
   if (v instanceof Date) {
-    const h = String(v.getUTCHours()).padStart(2, '0');
-    const mi = String(v.getUTCMinutes()).padStart(2, '0');
-    const sc = String(v.getUTCSeconds()).padStart(2, '0');
-    return `${h}:${mi}:${sc}`;
+    return v.getUTCHours() * 3600 + v.getUTCMinutes() * 60 + v.getUTCSeconds();
   }
   if (typeof v === 'number') {
     const neg = v < 0;
     const totalSec = Math.round(Math.abs(v) * 86400);
-    const h = String(Math.floor(totalSec / 3600)).padStart(2, '0');
-    const mi = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
-    const sc = String(totalSec % 60).padStart(2, '0');
-    return `${neg ? '-' : ''}${h}:${mi}:${sc}`;
+    return neg ? -totalSec : totalSec;
   }
   const str = String(v).trim();
   if (!str) return null;
@@ -136,31 +130,23 @@ function toInterval(v) {
   const abs = neg ? str.slice(1).trim() : str;
   const mMatch = abs.match(/^(\d{1,3}):(\d{1,2})(?::(\d{1,2}))?$/);
   if (mMatch) {
-    // Normalise overflow minutes/seconds (e.g. 00:68 → 01:08)
     const totalSec = parseInt(mMatch[1], 10) * 3600
                    + parseInt(mMatch[2], 10) * 60
                    + (mMatch[3] ? parseInt(mMatch[3], 10) : 0);
-    const h  = String(Math.floor(totalSec / 3600)).padStart(2, '0');
-    const mi = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
-    const sc = String(totalSec % 60).padStart(2, '0');
-    return `${neg ? '-' : ''}${h}:${mi}:${sc}`;
+    return neg ? -totalSec : totalSec;
   }
-  // numeric string (fraction of a day)
   const n = parseFloat(abs);
   if (!isNaN(n)) {
     const totalSec = Math.round(n * 86400);
-    const h  = String(Math.floor(totalSec / 3600)).padStart(2, '0');
-    const mi = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
-    const sc = String(totalSec % 60).padStart(2, '0');
-    return `${neg ? '-' : ''}${h}:${mi}:${sc}`;
+    return neg ? -totalSec : totalSec;
   }
   return null;
 }
 
-// ─── Helper: regular/casual → bool ────────────────────────────────────────────
+// ─── Helper: regular/casual → TINYINT 0/1 ────────────────────────────────────
 function toBoolRN(v) {
-  if (v === null || v === undefined) return true;
-  return String(v).trim().toUpperCase() !== 'CASUAL';
+  if (v === null || v === undefined) return 1;
+  return String(v).trim().toUpperCase() !== 'CASUAL' ? 1 : 0;
 }
 
 // ─── Read Excel sheet → array of arrays ──────────────────────────────────────
@@ -172,16 +158,16 @@ function readSheet(filename) {
 }
 
 // ─── Batch insert helper (chunked individual rows in a loop) ──────────────────
-async function insertBatch(client, sql, rows) {
+async function insertBatch(conn, sql, rows) {
   for (const row of rows) {
-    await client.query(sql, row);
+    await conn.execute(sql, row);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 1. import_hierarchy_master
 // ═══════════════════════════════════════════════════════════════════════════════
-async function import_hierarchy_master(client) {
+async function import_hierarchy_master(conn) {
   const rows = readSheet('Hieararchy Mast.xlsx');
   const unitPairs = new Map(); // unit_code → comp_code
   const dataRows = [];
@@ -197,7 +183,7 @@ async function import_hierarchy_master(client) {
     const hierarchy_code = s(r[5]);
     const hierarchy_level= toInt(r[6]);
     const reporting_to   = s(r[7]);
-    const is_active      = s(r[8]) === 'Y';
+    const is_active      = s(r[8]) === 'Y' ? 1 : 0;
     const employee_code  = s(r[9]);
 
     if (unit_code && comp_code) unitPairs.set(unit_code, comp_code);
@@ -210,9 +196,8 @@ async function import_hierarchy_master(client) {
   // Upsert units
   let unitCount = 0;
   for (const [unit_code, comp_code] of unitPairs) {
-    await client.query(
-      `INSERT INTO units (unit_code, comp_code) VALUES ($1,$2)
-       ON CONFLICT (unit_code) DO NOTHING`,
+    await conn.execute(
+      `INSERT IGNORE INTO units (unit_code, comp_code) VALUES (?,?)`,
       [unit_code, comp_code]
     );
     unitCount++;
@@ -224,24 +209,24 @@ async function import_hierarchy_master(client) {
       (comp_code, unit_code, person_code, person_name,
        hierarchy_code, hierarchy_level, reporting_to,
        is_active, employee_code)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-    ON CONFLICT (comp_code, unit_code, person_code) DO UPDATE SET
-      person_name     = EXCLUDED.person_name,
-      hierarchy_code  = EXCLUDED.hierarchy_code,
-      hierarchy_level = EXCLUDED.hierarchy_level,
-      reporting_to    = EXCLUDED.reporting_to,
-      is_active       = EXCLUDED.is_active,
-      employee_code   = EXCLUDED.employee_code,
+    VALUES (?,?,?,?,?,?,?,?,?)
+    ON DUPLICATE KEY UPDATE
+      person_name     = VALUES(person_name),
+      hierarchy_code  = VALUES(hierarchy_code),
+      hierarchy_level = VALUES(hierarchy_level),
+      reporting_to    = VALUES(reporting_to),
+      is_active       = VALUES(is_active),
+      employee_code   = VALUES(employee_code),
       updated_at      = NOW()
   `;
-  await insertBatch(client, sql, dataRows);
+  await insertBatch(conn, sql, dataRows);
   console.log(`  hierarchy_master: ${dataRows.length} rows upserted`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 2. import_hierarchy_mapping
 // ═══════════════════════════════════════════════════════════════════════════════
-async function import_hierarchy_mapping(client) {
+async function import_hierarchy_mapping(conn) {
   const rows = readSheet('HierMapping.xlsx');
   const unitRows = [];
   const mappingRows = [];
@@ -277,7 +262,7 @@ async function import_hierarchy_mapping(client) {
   }
 
   // Full refresh
-  await client.query('DELETE FROM hierarchy_mapping');
+  await conn.execute('DELETE FROM hierarchy_mapping');
 
   // Build unit_name lookup from what we read from the file
   const unitNameMap = {};
@@ -288,20 +273,19 @@ async function import_hierarchy_mapping(client) {
   // Upsert units (only update unit_name if not null)
   for (const [comp_code, unit_code, unit_name] of unitRows) {
     if (!unit_code) continue;
-    await client.query(
+    await conn.execute(
       `INSERT INTO units (unit_code, comp_code, unit_name)
-       VALUES ($1,$2,$3)
-       ON CONFLICT (unit_code) DO UPDATE SET
-         unit_name = CASE WHEN EXCLUDED.unit_name IS NOT NULL
-                          THEN EXCLUDED.unit_name
-                          ELSE units.unit_name END`,
+       VALUES (?,?,?)
+       ON DUPLICATE KEY UPDATE
+         unit_name = COALESCE(VALUES(unit_name), unit_name),
+         comp_code = VALUES(comp_code)`,
       [unit_code, comp_code, unit_name]
     );
   }
 
   // Also pull any unit_names we didn't get from the file (already in DB)
-  const dbNames = await client.query('SELECT unit_code, unit_name FROM units WHERE unit_name IS NOT NULL');
-  for (const row of dbNames.rows) {
+  const [dbNamesRows] = await conn.execute('SELECT unit_code, unit_name FROM units WHERE unit_name IS NOT NULL');
+  for (const row of dbNamesRows) {
     if (!unitNameMap[row.unit_code]) unitNameMap[row.unit_code] = row.unit_name;
   }
 
@@ -314,13 +298,13 @@ async function import_hierarchy_mapping(client) {
        circ_incharge_code, circ_incharge_name,
        zonal_head_code, zonal_head_name,
        vp_circulation_code, vp_circulation_name)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `;
   for (const [comp_code, unit_code, exec_code, exec_name, exec_desig,
               edtn_code, edtn_name, circ_code, circ_name,
               zonal_code, zonal_name, vp_code, vp_name] of mappingRows) {
     const unit_name = unitNameMap[unit_code] || null;
-    await client.query(sql, [comp_code, unit_code, unit_name,
+    await conn.execute(sql, [comp_code, unit_code, unit_name,
                               exec_code, exec_name, exec_desig,
                               edtn_code, edtn_name, circ_code, circ_name,
                               zonal_code, zonal_name, vp_code, vp_name]);
@@ -331,7 +315,7 @@ async function import_hierarchy_mapping(client) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // 3. import_drop_points_master
 // ═══════════════════════════════════════════════════════════════════════════════
-async function import_drop_points_master(client) {
+async function import_drop_points_master(conn) {
   const rows = readSheet('Taxi Drop Points.xlsx');
   const routeMap = new Map(); // route_code → route_name
   const dataRows = [];
@@ -367,10 +351,10 @@ async function import_drop_points_master(client) {
 
   // Upsert routes
   for (const [route_code, route_name] of routeMap) {
-    await client.query(
+    await conn.execute(
       `INSERT INTO routes (route_code, route_name)
-       VALUES ($1,$2)
-       ON CONFLICT (route_code) DO UPDATE SET route_name = EXCLUDED.route_name`,
+       VALUES (?,?)
+       ON DUPLICATE KEY UPDATE route_name = VALUES(route_name)`,
       [route_code, route_name]
     );
   }
@@ -382,32 +366,32 @@ async function import_drop_points_master(client) {
        driver_mobile, driver_name, taxi_id, vehicle_no,
        route_code, route_name, sub_route_code, sub_route_name,
        latitude, longitude, scheduled_arrival, last_seen_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-    ON CONFLICT (drop_point_code) DO UPDATE SET
-      drop_point_name   = EXCLUDED.drop_point_name,
-      unit_code         = EXCLUDED.unit_code,
-      unit_name         = EXCLUDED.unit_name,
-      driver_mobile     = EXCLUDED.driver_mobile,
-      driver_name       = EXCLUDED.driver_name,
-      taxi_id           = EXCLUDED.taxi_id,
-      vehicle_no        = EXCLUDED.vehicle_no,
-      route_code        = EXCLUDED.route_code,
-      route_name        = EXCLUDED.route_name,
-      sub_route_code    = EXCLUDED.sub_route_code,
-      sub_route_name    = EXCLUDED.sub_route_name,
-      latitude          = EXCLUDED.latitude,
-      longitude         = EXCLUDED.longitude,
-      scheduled_arrival = EXCLUDED.scheduled_arrival,
-      last_seen_at      = EXCLUDED.last_seen_at
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON DUPLICATE KEY UPDATE
+      drop_point_name   = VALUES(drop_point_name),
+      unit_code         = VALUES(unit_code),
+      unit_name         = VALUES(unit_name),
+      driver_mobile     = VALUES(driver_mobile),
+      driver_name       = VALUES(driver_name),
+      taxi_id           = VALUES(taxi_id),
+      vehicle_no        = VALUES(vehicle_no),
+      route_code        = VALUES(route_code),
+      route_name        = VALUES(route_name),
+      sub_route_code    = VALUES(sub_route_code),
+      sub_route_name    = VALUES(sub_route_name),
+      latitude          = VALUES(latitude),
+      longitude         = VALUES(longitude),
+      scheduled_arrival = VALUES(scheduled_arrival),
+      last_seen_at      = VALUES(last_seen_at)
   `;
-  await insertBatch(client, sql, dataRows);
+  await insertBatch(conn, sql, dataRows);
   console.log(`  drop_points_master: ${dataRows.length} rows upserted`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 4. import_taxi_delay_log
 // ═══════════════════════════════════════════════════════════════════════════════
-async function import_taxi_delay_log(client, reportDateOverride = null) {
+async function import_taxi_delay_log(conn, reportDateOverride = null) {
   const rows = readSheet('Taxi Delay Report.xlsx');
   const datesSeen = new Set();
   const dataRows = [];
@@ -434,9 +418,9 @@ async function import_taxi_delay_log(client, reportDateOverride = null) {
     const actual_departure = toTime(r[15]);
     const last_location    = s(r[16]);
     const reached_time     = toTime(r[17]);
-    const allowed_time     = toInterval(r[18]);
-    const time_taken       = toInterval(r[19]);
-    const taxi_delayed     = toInterval(r[20]);
+    const allowed_time     = toIntervalSecs(r[18]);
+    const time_taken       = toIntervalSecs(r[19]);
+    const taxi_delayed     = toIntervalSecs(r[20]);
     const route_master_km  = toFloat(r[21]);
     const total_app_km     = toFloat(r[22]);
 
@@ -452,7 +436,7 @@ async function import_taxi_delay_log(client, reportDateOverride = null) {
 
   // Delete existing records for these dates
   for (const d of datesSeen) {
-    await client.query('DELETE FROM taxi_delay_log WHERE report_date = $1', [d]);
+    await conn.execute('DELETE FROM taxi_delay_log WHERE report_date = ?', [d]);
   }
 
   const sql = `
@@ -463,16 +447,16 @@ async function import_taxi_delay_log(client, reportDateOverride = null) {
        start_location, scheduled_departure, actual_departure,
        last_location, reached_time, allowed_time, time_taken,
        taxi_delayed, route_master_km, total_app_km)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `;
-  await insertBatch(client, sql, dataRows);
+  await insertBatch(conn, sql, dataRows);
   console.log(`  taxi_delay_log: ${dataRows.length} rows inserted`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 5. import_drop_point_log
 // ═══════════════════════════════════════════════════════════════════════════════
-async function import_drop_point_log(client, reportDateOverride = null) {
+async function import_drop_point_log(conn, reportDateOverride = null) {
   const rows = readSheet('App Taxi Drop Point Wise Report.xlsx');
   const routeMap = new Map();
   const datesSeen = new Set();
@@ -496,7 +480,7 @@ async function import_drop_point_log(client, reportDateOverride = null) {
     const packet_drop_date = toDate(r[11]);
     const scheduled_arrival= toTime(r[12]);
     const actual_arrival   = toTime(r[13]);
-    const time_diff        = toInterval(r[14]);
+    const time_diff        = toIntervalSecs(r[14]);
     const taxi_id          = s(r[15]);
     const reg_lat          = toFloat(r[16]);
     const reg_long         = toFloat(r[17]);
@@ -507,10 +491,10 @@ async function import_drop_point_log(client, reportDateOverride = null) {
     const return_km        = toFloat(r[22]);
     const actual_km        = toFloat(r[23]);
     const total_distance   = toFloat(r[24]);
-    const duration         = toInterval(r[25]);
+    const duration         = toIntervalSecs(r[25]);
     const lat_long_addr    = s(r[26]);
     const api_distance     = toFloat(r[27]);
-    const vehicle_sharing  = s(r[28]) !== 'N';
+    const vehicle_sharing  = s(r[28]) !== 'N' ? 1 : 0;
     const last_drop_point  = s(r[29]);
     const dropping_lat_long= s(r[30]);
 
@@ -529,17 +513,17 @@ async function import_drop_point_log(client, reportDateOverride = null) {
 
   // Upsert routes
   for (const [route_code, route_name] of routeMap) {
-    await client.query(
+    await conn.execute(
       `INSERT INTO routes (route_code, route_name)
-       VALUES ($1,$2)
-       ON CONFLICT (route_code) DO UPDATE SET route_name = EXCLUDED.route_name`,
+       VALUES (?,?)
+       ON DUPLICATE KEY UPDATE route_name = VALUES(route_name)`,
       [route_code, route_name]
     );
   }
 
   // Delete for dates seen
   for (const d of datesSeen) {
-    await client.query('DELETE FROM taxi_drop_point_log WHERE sup_date = $1', [d]);
+    await conn.execute('DELETE FROM taxi_drop_point_log WHERE sup_date = ?', [d]);
   }
 
   const sql = `
@@ -552,16 +536,16 @@ async function import_drop_point_log(client, reportDateOverride = null) {
        dist_diff, route_master_km, return_km, actual_km,
        total_distance, duration, lat_long_addr, api_distance,
        vehicle_sharing, last_drop_point, dropping_lat_long)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `;
-  await insertBatch(client, sql, dataRows);
+  await insertBatch(conn, sql, dataRows);
   console.log(`  drop_point_log: ${dataRows.length} rows inserted`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 6. import_agency_outstanding
 // ═══════════════════════════════════════════════════════════════════════════════
-async function import_agency_outstanding(client) {
+async function import_agency_outstanding(conn) {
   const rows = readSheet('Agency Outstanding.xlsx');
   const dataRows = [];
   let maxDate = null;
@@ -623,10 +607,7 @@ async function import_agency_outstanding(client) {
   }
 
   if (report_date) {
-    await client.query(
-      'DELETE FROM agency_outstanding WHERE report_date = $1',
-      [report_date]
-    );
+    await conn.execute('DELETE FROM agency_outstanding WHERE report_date = ?', [report_date]);
   }
 
   const sql = `
@@ -639,39 +620,39 @@ async function import_agency_outstanding(client) {
        receipt_amount, other_credits, closing_debit, closing_credit,
        collection_pct, mobile_no, agency_type, supply_start_date,
        supply_days, last_supply_date, last_supply_post)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
-    ON CONFLICT (report_date, ag_code) DO UPDATE SET
-      state_region      = EXCLUDED.state_region,
-      unit_name         = EXCLUDED.unit_name,
-      agency_name       = EXCLUDED.agency_name,
-      executive         = EXCLUDED.executive,
-      status            = EXCLUDED.status,
-      zonal_head        = EXCLUDED.zonal_head,
-      state             = EXCLUDED.state,
-      district          = EXCLUDED.district,
-      drop_point        = EXCLUDED.drop_point,
-      total_copies      = EXCLUDED.total_copies,
-      daily_copies      = EXCLUDED.daily_copies,
-      security_deposit  = EXCLUDED.security_deposit,
-      required_security = EXCLUDED.required_security,
-      security_diff     = EXCLUDED.security_diff,
-      opening_debit     = EXCLUDED.opening_debit,
-      opening_credit    = EXCLUDED.opening_credit,
-      bill_amount       = EXCLUDED.bill_amount,
-      other_debits      = EXCLUDED.other_debits,
-      receipt_amount    = EXCLUDED.receipt_amount,
-      other_credits     = EXCLUDED.other_credits,
-      closing_debit     = EXCLUDED.closing_debit,
-      closing_credit    = EXCLUDED.closing_credit,
-      collection_pct    = EXCLUDED.collection_pct,
-      mobile_no         = EXCLUDED.mobile_no,
-      agency_type       = EXCLUDED.agency_type,
-      supply_start_date = EXCLUDED.supply_start_date,
-      supply_days       = EXCLUDED.supply_days,
-      last_supply_date  = EXCLUDED.last_supply_date,
-      last_supply_post  = EXCLUDED.last_supply_post
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON DUPLICATE KEY UPDATE
+      state_region      = VALUES(state_region),
+      unit_name         = VALUES(unit_name),
+      agency_name       = VALUES(agency_name),
+      executive         = VALUES(executive),
+      status            = VALUES(status),
+      zonal_head        = VALUES(zonal_head),
+      state             = VALUES(state),
+      district          = VALUES(district),
+      drop_point        = VALUES(drop_point),
+      total_copies      = VALUES(total_copies),
+      daily_copies      = VALUES(daily_copies),
+      security_deposit  = VALUES(security_deposit),
+      required_security = VALUES(required_security),
+      security_diff     = VALUES(security_diff),
+      opening_debit     = VALUES(opening_debit),
+      opening_credit    = VALUES(opening_credit),
+      bill_amount       = VALUES(bill_amount),
+      other_debits      = VALUES(other_debits),
+      receipt_amount    = VALUES(receipt_amount),
+      other_credits     = VALUES(other_credits),
+      closing_debit     = VALUES(closing_debit),
+      closing_credit    = VALUES(closing_credit),
+      collection_pct    = VALUES(collection_pct),
+      mobile_no         = VALUES(mobile_no),
+      agency_type       = VALUES(agency_type),
+      supply_start_date = VALUES(supply_start_date),
+      supply_days       = VALUES(supply_days),
+      last_supply_date  = VALUES(last_supply_date),
+      last_supply_post  = VALUES(last_supply_post)
   `;
-  await insertBatch(client, sql, dataRows);
+  await insertBatch(conn, sql, dataRows);
   console.log(`  agency_outstanding: ${dataRows.length} rows upserted (report_date=${report_date})`);
 }
 
@@ -698,7 +679,7 @@ function dateToISO(dt) {
   return `${y}-${m}-${d}`;
 }
 
-async function import_daily_supply(client, rptDate = null) {
+async function import_daily_supply(conn, rptDate = null) {
   const rows = readSheet('Supply.xlsx');
   if (rows.length === 0) return;
 
@@ -757,7 +738,7 @@ async function import_daily_supply(client, rptDate = null) {
 
   // Delete for dates seen
   for (const d of datesSeen) {
-    await client.query('DELETE FROM daily_supply WHERE supply_date = $1', [d]);
+    await conn.execute('DELETE FROM daily_supply WHERE supply_date = ?', [d]);
   }
 
   const sql = `
@@ -765,22 +746,22 @@ async function import_daily_supply(client, rptDate = null) {
       (supply_date, ag_code, agency_name, unit_name, executive,
        zonal_head, state_region, copies_supplied,
        district, city, drop_point, edition_name, agency_type, mobile_no)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-    ON CONFLICT (supply_date, ag_code) DO UPDATE SET
-      agency_name     = EXCLUDED.agency_name,
-      unit_name       = EXCLUDED.unit_name,
-      executive       = EXCLUDED.executive,
-      zonal_head      = EXCLUDED.zonal_head,
-      state_region    = EXCLUDED.state_region,
-      copies_supplied = EXCLUDED.copies_supplied,
-      district        = EXCLUDED.district,
-      city            = EXCLUDED.city,
-      drop_point      = EXCLUDED.drop_point,
-      edition_name    = EXCLUDED.edition_name,
-      agency_type     = EXCLUDED.agency_type,
-      mobile_no       = EXCLUDED.mobile_no
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON DUPLICATE KEY UPDATE
+      agency_name     = VALUES(agency_name),
+      unit_name       = VALUES(unit_name),
+      executive       = VALUES(executive),
+      zonal_head      = VALUES(zonal_head),
+      state_region    = VALUES(state_region),
+      copies_supplied = VALUES(copies_supplied),
+      district        = VALUES(district),
+      city            = VALUES(city),
+      drop_point      = VALUES(drop_point),
+      edition_name    = VALUES(edition_name),
+      agency_type     = VALUES(agency_type),
+      mobile_no       = VALUES(mobile_no)
   `;
-  await insertBatch(client, sql, dataRows);
+  await insertBatch(conn, sql, dataRows);
   console.log(`  daily_supply: ${dataRows.length} rows upserted`);
 }
 
@@ -804,7 +785,7 @@ function normalizePaymentMode(v) {
   return PAYMENT_MODE_MAP[upper] || raw;
 }
 
-async function import_daily_collection(client, rptDate = null) {
+async function import_daily_collection(conn, rptDate = null) {
   const rows = readSheet('Collection Register.xlsx');
   const datesSeen = new Set();
   const dataRows = [];
@@ -840,7 +821,7 @@ async function import_daily_collection(client, rptDate = null) {
 
   // Delete for dates seen
   for (const d of datesSeen) {
-    await client.query('DELETE FROM daily_collection WHERE collection_date = $1', [d]);
+    await conn.execute('DELETE FROM daily_collection WHERE collection_date = ?', [d]);
   }
 
   const sql = `
@@ -848,9 +829,9 @@ async function import_daily_collection(client, rptDate = null) {
       (collection_date, ag_code, customer_name, unit_name, executive,
        zonal_head, state_region, amount, payment_mode, sale_type,
        receipt_no, district, drop_point, mobile_no)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `;
-  await insertBatch(client, sql, dataRows);
+  await insertBatch(conn, sql, dataRows);
   console.log(`  daily_collection: ${dataRows.length} rows inserted`);
 }
 
@@ -878,32 +859,31 @@ function parseArgs() {
 async function main() {
   const { dateOverride, fileFilter } = parseArgs();
 
-  const client = new Client(DB_CONFIG);
-  await client.connect();
+  const conn = await mysql.createConnection(MYSQL_CONFIG);
 
   try {
-    await client.query('BEGIN');
+    await conn.beginTransaction();
 
     const run = (name) =>
       fileFilter === 'all' || fileFilter === name;
 
-    if (run('hierarchy'))    await import_hierarchy_master(client);
-    if (run('mapping'))      await import_hierarchy_mapping(client);
-    if (run('dropmaster'))   await import_drop_points_master(client);
-    if (run('delay'))        await import_taxi_delay_log(client, dateOverride);
-    if (run('droplog'))      await import_drop_point_log(client, dateOverride);
-    if (run('outstanding'))  await import_agency_outstanding(client);
-    if (run('supply') || run('daily')) await import_daily_supply(client, dateOverride);
-    if (run('collection'))   await import_daily_collection(client, dateOverride);
+    if (run('hierarchy'))    await import_hierarchy_master(conn);
+    if (run('mapping'))      await import_hierarchy_mapping(conn);
+    if (run('dropmaster'))   await import_drop_points_master(conn);
+    if (run('delay'))        await import_taxi_delay_log(conn, dateOverride);
+    if (run('droplog'))      await import_drop_point_log(conn, dateOverride);
+    if (run('outstanding'))  await import_agency_outstanding(conn);
+    if (run('supply') || run('daily')) await import_daily_supply(conn, dateOverride);
+    if (run('collection'))   await import_daily_collection(conn, dateOverride);
 
-    await client.query('COMMIT');
+    await conn.commit();
     console.log('Done.');
   } catch (err) {
-    await client.query('ROLLBACK');
+    await conn.rollback();
     console.error('Import failed, rolled back:', err.message);
     process.exit(1);
   } finally {
-    await client.end();
+    await conn.end();
   }
 }
 

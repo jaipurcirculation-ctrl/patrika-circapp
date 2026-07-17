@@ -28,6 +28,7 @@
     "dotenv": "^17.4.2",
     "express": "^4.19.2",
     "finalhandler": "^1.2.0",
+    "mysql2": "^3.23.0",
     "oracledb": "^6.10.0",
     "pg": "^8.11.3",
     "serve-static": "^1.15.0",

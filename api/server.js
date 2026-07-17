@@ -1,35 +1,39 @@
 'use strict';
 
 /**
- * Patrika Vitran Suite — REST API server (Node.js / Express)
- * Port of server.py (FastAPI + psycopg2) to Express + pg
+ * Patrika Vitran Suite — REST API server (Node.js / Express + MySQL)
  */
 
 const express = require('express');
-const cors = require('cors');
-const pg = require('pg');
-const { Pool } = pg;
-const path = require('path');
+const cors    = require('cors');
+const mysql   = require('mysql2/promise');
+const path    = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
-// ── Configuration (from .env) ─────────────────────────────────────────────────
+// ── Configuration ─────────────────────────────────────────────────────────────
 const DB_CONFIG = {
-  host:     process.env.DB_HOST     || 'localhost',
-  port:     parseInt(process.env.DB_PORT || '5432', 10),
-  database: process.env.DB_NAME     || 'patrika_vitran',
-  user:     process.env.DB_USER     || 'postgres',
-  password: process.env.DB_PASSWORD || '',
+  host:        process.env.MYSQL_HOST     || 'localhost',
+  port:        parseInt(process.env.MYSQL_PORT || '3306', 10),
+  database:    process.env.MYSQL_DB       || 'patrika_vitran',
+  user:        process.env.MYSQL_USER     || 'root',
+  password:    process.env.MYSQL_PASSWORD || '',
+  waitForConnections: true,
+  connectionLimit:    10,
+  dateStrings: true,   // return DATE/DATETIME as 'YYYY-MM-DD' strings
 };
 
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || 'http://localhost:8123').split(',');
+const API_PORT     = parseInt(process.env.API_PORT || '8000', 10);
 
-const API_PORT = parseInt(process.env.API_PORT || '8000', 10);
+const pool = mysql.createPool(DB_CONFIG);
 
-// ── pg type parsers ───────────────────────────────────────────────────────────
-pg.types.setTypeParser(1700, parseFloat); // NUMERIC → float
-pg.types.setTypeParser(20, Number);        // BIGINT  → number
-
-const pool = new Pool(DB_CONFIG);
+// pool.execute() returns [rows, fields] — this wrapper gives a pg-like { rows } interface
+async function q(sql, params) {
+  const [rows] = await pool.execute(sql, params || []);
+  return { rows };
+}
+// For transactions, get a raw connection
+async function getConn() { return pool.getConnection(); }
 
 // ── Express setup ─────────────────────────────────────────────────────────────
 const app = express();
@@ -45,10 +49,7 @@ app.use(express.json());
  */
 async function userIdFromMobile(runner, mobile) {
   if (!mobile) return null;
-  const { rows } = await runner.query(
-    'SELECT id FROM users WHERE mobile = $1',
-    [mobile]
-  );
+  const [rows] = await runner.execute('SELECT id FROM users WHERE mobile = ?', [mobile]);
   return rows.length ? rows[0].id : null;
 }
 
@@ -119,36 +120,37 @@ async function getScopeUnitCodes(personCode, hierarchyLevel) {
 
   const col = LEVEL_COL[hierarchyLevel];
   if (col) {
-    const { rows } = await pool.query(
-      `SELECT DISTINCT unit_code FROM hierarchy_mapping WHERE ${col} = $1`,
+    const { rows } = await q(
+      `SELECT DISTINCT unit_code FROM hierarchy_mapping WHERE ${col} = ?`,
       [String(personCode)]
     );
     return rows.map((r) => r.unit_code);
   }
 
-  // For levels 7, 9, 10 and any other non-mapped level: look up own unit
-  const { rows } = await pool.query(
-    'SELECT unit_code FROM hierarchy_master WHERE person_code = $1 AND is_active = TRUE',
+  const { rows } = await q(
+    'SELECT unit_code FROM hierarchy_master WHERE person_code = ? AND is_active = 1',
     [String(personCode)]
   );
   const row = rows[0];
   return row && row.unit_code ? [row.unit_code] : [];
 }
 
-/**
- * Translate unit_codes into taxi unit names used in taxi_delay_log /
- * taxi_drop_point_log tables.
- */
 async function scopeToTaxiNames(unitCodes) {
   if (!unitCodes || unitCodes.length === 0) return [];
-  const { rows } = await pool.query(
+  const ph = unitCodes.map(() => '?').join(',');
+  const { rows } = await q(
     `SELECT DISTINCT tdl.unit_name
      FROM taxi_delay_log tdl
-     JOIN units u ON (tdl.unit_name = u.unit_name OR tdl.unit_name = u.unit_name || ' RP')
-     WHERE u.unit_code = ANY($1)`,
-    [unitCodes]
+     JOIN units u ON (tdl.unit_name = u.unit_name OR tdl.unit_name = CONCAT(u.unit_name, ' RP'))
+     WHERE u.unit_code IN (${ph})`,
+    unitCodes
   );
   return rows.map((r) => r.unit_name);
+}
+
+/** Build  IN (?,?,?)  clause + params array for MySQL from an array value */
+function inClause(arr) {
+  return { sql: `IN (${arr.map(() => '?').join(',')})`, params: arr };
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -156,7 +158,7 @@ async function scopeToTaxiNames(unitCodes) {
 // GET /api/health
 app.get('/api/health', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT COUNT(*) AS n FROM users');
+    const { rows } = await q('SELECT COUNT(*) AS n FROM users');
     res.json({ status: 'ok', users: Number(rows[0].n) });
   } catch (e) {
     res.status(503).json({ status: 'db_error', detail: String(e) });
@@ -168,14 +170,11 @@ app.post('/api/login', async (req, res) => {
   try {
     const mobile = String(req.body.mobile || '').trim().replace(/\s/g, '');
     const { password } = req.body;
-    const { rows } = await pool.query(
-      `SELECT id, mobile, name, role, district FROM users
-       WHERE mobile = $1 AND password = $2 AND is_active = TRUE`,
+    const { rows } = await q(
+      'SELECT id, mobile, name, role, district FROM users WHERE mobile = ? AND password = ? AND is_active = 1',
       [mobile, password]
     );
-    if (!rows.length) {
-      return res.status(401).json({ detail: 'Invalid mobile number or password' });
-    }
+    if (!rows.length) return res.status(401).json({ detail: 'Invalid mobile number or password' });
     res.json(rows[0]);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -185,9 +184,7 @@ app.post('/api/login', async (req, res) => {
 // GET /api/customers
 app.get('/api/customers', async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      'SELECT * FROM customers ORDER BY created_at DESC LIMIT 200'
-    );
+    const { rows } = await q('SELECT * FROM customers ORDER BY created_at DESC LIMIT 200');
     res.json(rows);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -196,37 +193,29 @@ app.get('/api/customers', async (req, res) => {
 
 // POST /api/customers
 app.post('/api/customers', async (req, res) => {
-  const client = await pool.connect();
+  const conn = await getConn();
   try {
-    await client.query('BEGIN');
-    const mobile = req.headers['x-user-mobile'];
-    const uid = await userIdFromMobile(client, mobile);
+    await conn.beginTransaction();
+    const uid = await userIdFromMobile(conn, req.headers['x-user-mobile']);
     const { name, address, phone, plan } = req.body;
-    const { rows } = await client.query(
-      `INSERT INTO customers (name, address, mobile, edition, copies, agent_id)
-       VALUES ($1, $2, $3, $4, 1, $5) RETURNING id`,
+    const [result] = await conn.execute(
+      'INSERT INTO customers (name, address, mobile, edition, copies, agent_id) VALUES (?,?,?,?,1,?)',
       [name, address, phone, plan, uid]
     );
-    await client.query('COMMIT');
-    res.json({ id: rows[0].id, message: 'Customer created ✓' });
+    await conn.commit();
+    res.json({ id: result.insertId, message: 'Customer created ✓' });
   } catch (e) {
-    await client.query('ROLLBACK');
+    await conn.rollback();
     res.status(500).json({ detail: String(e) });
-  } finally {
-    client.release();
-  }
+  } finally { conn.release(); }
 });
 
 // GET /api/stops
 app.get('/api/stops', async (req, res) => {
   try {
-    const mobile = req.headers['x-user-mobile'];
-    const uid = await userIdFromMobile(pool, mobile);
+    const uid = await userIdFromMobile(pool, req.headers['x-user-mobile']);
     if (!uid) return res.json([]);
-    const { rows } = await pool.query(
-      'SELECT * FROM stops WHERE hawker_id = $1 AND trip_date = CURRENT_DATE ORDER BY id',
-      [uid]
-    );
+    const { rows } = await q('SELECT * FROM stops WHERE hawker_id = ? AND trip_date = CURDATE() ORDER BY id', [uid]);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -236,12 +225,7 @@ app.get('/api/stops', async (req, res) => {
 // POST /api/stops/:stop_id/mark
 app.post('/api/stops/:stop_id/mark', async (req, res) => {
   try {
-    const stopId = parseInt(req.params.stop_id, 10);
-    const { status } = req.body;
-    await pool.query(
-      'UPDATE stops SET status = $1, marked_at = NOW() WHERE id = $2',
-      [status, stopId]
-    );
+    await q('UPDATE stops SET status = ?, marked_at = NOW() WHERE id = ?', [req.body.status, parseInt(req.params.stop_id, 10)]);
     res.json({ message: 'Stop updated ✓' });
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -251,9 +235,7 @@ app.post('/api/stops/:stop_id/mark', async (req, res) => {
 // GET /api/payments
 app.get('/api/payments', async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      'SELECT * FROM payments ORDER BY collected_at DESC LIMIT 100'
-    );
+    const { rows } = await q('SELECT * FROM payments ORDER BY collected_at DESC LIMIT 100');
     res.json(rows);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -262,33 +244,27 @@ app.get('/api/payments', async (req, res) => {
 
 // POST /api/payments
 app.post('/api/payments', async (req, res) => {
-  const client = await pool.connect();
+  const conn = await getConn();
   try {
-    await client.query('BEGIN');
-    const mobile = req.headers['x-user-mobile'];
-    const uid = await userIdFromMobile(client, mobile);
+    await conn.beginTransaction();
+    const uid = await userIdFromMobile(conn, req.headers['x-user-mobile']);
     const { customer_name, amount, method, notes = '' } = req.body;
-    const { rows } = await client.query(
-      `INSERT INTO payments (amount, collected_by, method, notes)
-       VALUES ($1, $2, $3, $4) RETURNING id`,
+    const [result] = await conn.execute(
+      'INSERT INTO payments (amount, collected_by, method, notes) VALUES (?,?,?,?)',
       [amount, uid, method, `${customer_name} · ${notes}`]
     );
-    await client.query('COMMIT');
-    res.json({ id: rows[0].id, message: 'Payment recorded ✓' });
+    await conn.commit();
+    res.json({ id: result.insertId, message: 'Payment recorded ✓' });
   } catch (e) {
-    await client.query('ROLLBACK');
+    await conn.rollback();
     res.status(500).json({ detail: String(e) });
-  } finally {
-    client.release();
-  }
+  } finally { conn.release(); }
 });
 
 // GET /api/complaints
 app.get('/api/complaints', async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      'SELECT * FROM complaints ORDER BY created_at DESC LIMIT 100'
-    );
+    const { rows } = await q('SELECT * FROM complaints ORDER BY created_at DESC LIMIT 100');
     res.json(rows);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -297,38 +273,31 @@ app.get('/api/complaints', async (req, res) => {
 
 // POST /api/complaints
 app.post('/api/complaints', async (req, res) => {
-  const client = await pool.connect();
+  const conn = await getConn();
   try {
-    await client.query('BEGIN');
-    const mobile = req.headers['x-user-mobile'];
-    const uid = await userIdFromMobile(client, mobile);
+    await conn.beginTransaction();
+    const uid = await userIdFromMobile(conn, req.headers['x-user-mobile']);
     const { customer_name, complaint_type, route, priority, description = '' } = req.body;
     const fullDesc = `Customer: ${customer_name} | Route: ${route} | Priority: ${priority} | ${description}`;
-    const { rows } = await client.query(
-      `INSERT INTO complaints (type, description, raised_by)
-       VALUES ($1, $2, $3) RETURNING id`,
+    const [result] = await conn.execute(
+      'INSERT INTO complaints (type, description, raised_by) VALUES (?,?,?)',
       [complaint_type, fullDesc, uid]
     );
-    await client.query('COMMIT');
-    res.json({ id: rows[0].id, message: 'Complaint logged ✓' });
+    await conn.commit();
+    res.json({ id: result.insertId, message: 'Complaint logged ✓' });
   } catch (e) {
-    await client.query('ROLLBACK');
+    await conn.rollback();
     res.status(500).json({ detail: String(e) });
-  } finally {
-    client.release();
-  }
+  } finally { conn.release(); }
 });
 
 // GET /api/visits
 app.get('/api/visits', async (req, res) => {
   try {
-    const mobile = req.headers['x-user-mobile'];
-    const uid = await userIdFromMobile(pool, mobile);
+    const uid = await userIdFromMobile(pool, req.headers['x-user-mobile']);
     if (!uid) return res.json([]);
-    const { rows } = await pool.query(
-      `SELECT * FROM dcr_visits
-       WHERE dcr_id = $1 AND visit_date = CURRENT_DATE
-       ORDER BY created_at DESC`,
+    const { rows } = await q(
+      'SELECT * FROM dcr_visits WHERE dcr_id = ? AND visit_date = CURDATE() ORDER BY created_at DESC',
       [uid]
     );
     res.json(rows);
@@ -339,40 +308,32 @@ app.get('/api/visits', async (req, res) => {
 
 // POST /api/visits
 app.post('/api/visits', async (req, res) => {
-  const client = await pool.connect();
+  const conn = await getConn();
   try {
-    await client.query('BEGIN');
-    const mobile = req.headers['x-user-mobile'];
-    const uid = await userIdFromMobile(client, mobile);
+    await conn.beginTransaction();
+    const uid = await userIdFromMobile(conn, req.headers['x-user-mobile']);
     const { visit_type, target, outcome, amount = 0, notes = '' } = req.body;
     let note = outcome;
     if (amount) note += ` · collected ₹${amount}`;
     if (notes) note += ` · ${notes}`;
-    const { rows } = await client.query(
-      `INSERT INTO dcr_visits (dcr_id, outlet_name, purpose, outcome)
-       VALUES ($1, $2, $3, $4) RETURNING id`,
+    const [result] = await conn.execute(
+      'INSERT INTO dcr_visits (dcr_id, outlet_name, purpose, outcome) VALUES (?,?,?,?)',
       [uid, target, visit_type, note]
     );
-    await client.query('COMMIT');
-    res.json({ id: rows[0].id, message: 'Visit saved ✓' });
+    await conn.commit();
+    res.json({ id: result.insertId, message: 'Visit saved ✓' });
   } catch (e) {
-    await client.query('ROLLBACK');
+    await conn.rollback();
     res.status(500).json({ detail: String(e) });
-  } finally {
-    client.release();
-  }
+  } finally { conn.release(); }
 });
 
 // GET /api/leads
 app.get('/api/leads', async (req, res) => {
   try {
-    const mobile = req.headers['x-user-mobile'];
-    const uid = await userIdFromMobile(pool, mobile);
+    const uid = await userIdFromMobile(pool, req.headers['x-user-mobile']);
     if (!uid) return res.json([]);
-    const { rows } = await pool.query(
-      'SELECT * FROM leads WHERE surveyor_id = $1 ORDER BY created_at DESC',
-      [uid]
-    );
+    const { rows } = await q('SELECT * FROM leads WHERE surveyor_id = ? ORDER BY created_at DESC', [uid]);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -381,40 +342,28 @@ app.get('/api/leads', async (req, res) => {
 
 // POST /api/leads
 app.post('/api/leads', async (req, res) => {
-  const client = await pool.connect();
+  const conn = await getConn();
   try {
-    await client.query('BEGIN');
-    const mobile = req.headers['x-user-mobile'];
-    const uid = await userIdFromMobile(client, mobile);
-    const { name, mobile: leadMobile, area, publication, interest, notes = '' } = req.body;
-    const interestLevel = interest.startsWith('High')
-      ? 'hot'
-      : interest.startsWith('Low')
-      ? 'cold'
-      : 'medium';
-    const { rows } = await client.query(
-      `INSERT INTO leads (surveyor_id, name, mobile, address, edition, interest)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [uid, name, leadMobile, area, publication, interestLevel]
+    await conn.beginTransaction();
+    const uid = await userIdFromMobile(conn, req.headers['x-user-mobile']);
+    const { name, mobile: leadMobile, area, publication, interest } = req.body;
+    const lvl = interest.startsWith('High') ? 'hot' : interest.startsWith('Low') ? 'cold' : 'medium';
+    const [result] = await conn.execute(
+      'INSERT INTO leads (surveyor_id, name, mobile, address, edition, interest) VALUES (?,?,?,?,?,?)',
+      [uid, name, leadMobile, area, publication, lvl]
     );
-    await client.query('COMMIT');
-    res.json({ id: rows[0].id, message: 'Lead saved ✓' });
+    await conn.commit();
+    res.json({ id: result.insertId, message: 'Lead saved ✓' });
   } catch (e) {
-    await client.query('ROLLBACK');
+    await conn.rollback();
     res.status(500).json({ detail: String(e) });
-  } finally {
-    client.release();
-  }
+  } finally { conn.release(); }
 });
 
 // GET /api/trips
 app.get('/api/trips', async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT * FROM trips
-       WHERE trip_date = CURRENT_DATE
-       ORDER BY created_at DESC LIMIT 20`
-    );
+    const { rows } = await q('SELECT * FROM trips WHERE trip_date = CURDATE() ORDER BY created_at DESC LIMIT 20');
     res.json(rows);
   } catch (e) {
     res.status(500).json({ detail: String(e) });
@@ -423,37 +372,33 @@ app.get('/api/trips', async (req, res) => {
 
 // POST /api/trips
 app.post('/api/trips', async (req, res) => {
-  const client = await pool.connect();
+  const conn = await getConn();
   try {
-    await client.query('BEGIN');
-    const mobile = req.headers['x-user-mobile'];
-    const uid = await userIdFromMobile(client, mobile);
+    await conn.beginTransaction();
+    const uid = await userIdFromMobile(conn, req.headers['x-user-mobile']);
     const { vehicle_no, route, bundles = 0 } = req.body;
-    const { rows } = await client.query(
-      `INSERT INTO trips (driver_id, vehicle_no, route, bundles)
-       VALUES ($1, $2, $3, $4) RETURNING id`,
+    const [result] = await conn.execute(
+      'INSERT INTO trips (driver_id, vehicle_no, route_code, bundles) VALUES (?,?,?,?)',
       [uid, vehicle_no, route, bundles]
     );
-    await client.query('COMMIT');
-    res.json({ id: rows[0].id, message: 'Trip logged ✓' });
+    await conn.commit();
+    res.json({ id: result.insertId, message: 'Trip logged ✓' });
   } catch (e) {
-    await client.query('ROLLBACK');
+    await conn.rollback();
     res.status(500).json({ detail: String(e) });
-  } finally {
-    client.release();
-  }
+  } finally { conn.release(); }
 });
 
 // GET /api/hierarchy/users
 app.get('/api/hierarchy/users', async (req, res) => {
   try {
-    const { rows } = await pool.query(`
+    const { rows } = await q(`
       SELECT hm.id, hm.person_code, hm.person_name, hm.hierarchy_level,
              hm.unit_code, COALESCE(u.unit_name, hm.unit_code) AS unit_name,
              hm.reporting_to, hm.employee_code
       FROM hierarchy_master hm
       LEFT JOIN units u ON u.unit_code = hm.unit_code
-      WHERE hm.is_active = TRUE
+      WHERE hm.is_active = 1
       ORDER BY hm.hierarchy_level, hm.person_name
     `);
     const users = rows.map((r) => {
@@ -521,9 +466,7 @@ app.get('/api/dashboard/delivery', async (req, res) => {
     const hl = hlRaw && /^\d+$/.test(hlRaw) ? parseInt(hlRaw, 10) : 1;
 
     if (!range) {
-      const { rows } = await pool.query(
-        "SELECT MAX(report_date)::text AS max FROM taxi_delay_log"
-      );
+      const { rows } = await q('SELECT DATE_FORMAT(MAX(report_date),\'%Y-%m-%d\') AS max FROM taxi_delay_log');
       const d = (rows[0] && rows[0].max) ? rows[0].max : new Date().toISOString().slice(0, 10);
       range = { from: d, to: d };
     }
@@ -535,112 +478,89 @@ app.get('/api/dashboard/delivery', async (req, res) => {
     if (taxiNames !== null && taxiNames.length === 0) {
       return res.json({
         date, from: range.from, to: range.to,
-        summary: {
-          total_routes: 0, total_supply: 0, on_time: 0, delayed: 0,
-          otd_pct: 0, planned_km: 0, actual_km: 0, delivered_drops: 0,
-          active_routes: 0, planned_drops: 0, missed_drops: 0,
-        },
+        summary: { total_routes:0, total_supply:0, on_time:0, delayed:0, otd_pct:0, planned_km:0, actual_km:0, delivered_drops:0, active_routes:0, planned_drops:0, missed_drops:0 },
         units: [],
       });
     }
 
-    // ── Summary query ──
-    const summaryParams = [range.from, range.to];
-    let scopeFilter = '';
-    if (taxiNames !== null) {
-      summaryParams.push(taxiNames);
-      scopeFilter = `AND unit_name = ANY($${summaryParams.length})`;
-    }
-    const { rows: [summaryRow] } = await pool.query(`
+    // taxi_delayed is INT (signed seconds): <= 0 = on-time, > 0 = delayed
+    const nameFilter = taxiNames !== null ? inClause(taxiNames) : null;
+
+    const sFilter = nameFilter ? `AND unit_name ${nameFilter.sql}` : '';
+    const sParams = nameFilter ? nameFilter.params : [];
+
+    const { rows: [summaryRow] } = await q(`
       SELECT COUNT(*) AS total_routes,
-        COALESCE(SUM(supply), 0)::float AS total_supply,
-        COALESCE(SUM(CASE WHEN taxi_delayed <= interval '0' THEN 1 ELSE 0 END), 0) AS on_time,
-        COALESCE(SUM(CASE WHEN taxi_delayed  > interval '0' THEN 1 ELSE 0 END), 0) AS delayed,
-        COALESCE(ROUND(100.0 * SUM(CASE WHEN taxi_delayed <= interval '0' THEN 1 ELSE 0 END)::numeric
-          / NULLIF(COUNT(*),0), 1), 0)::float AS otd_pct,
-        COALESCE(SUM(route_master_km), 0)::float AS planned_km,
-        COALESCE(SUM(total_app_km), 0)::float AS actual_km
-      FROM taxi_delay_log WHERE report_date BETWEEN $1 AND $2 ${scopeFilter}
-    `, summaryParams);
+        COALESCE(SUM(supply), 0) AS total_supply,
+        COALESCE(SUM(CASE WHEN COALESCE(taxi_delayed,1) <= 0 THEN 1 ELSE 0 END), 0) AS on_time,
+        COALESCE(SUM(CASE WHEN COALESCE(taxi_delayed,1)  > 0 THEN 1 ELSE 0 END), 0) AS delayed,
+        COALESCE(ROUND(100.0 * SUM(CASE WHEN COALESCE(taxi_delayed,1) <= 0 THEN 1 ELSE 0 END)
+          / NULLIF(COUNT(*),0), 1), 0) AS otd_pct,
+        COALESCE(SUM(route_master_km), 0) AS planned_km,
+        COALESCE(SUM(total_app_km), 0) AS actual_km
+      FROM taxi_delay_log WHERE report_date BETWEEN ? AND ? ${sFilter}
+    `, [range.from, range.to, ...sParams]);
 
-    // ── Delivered drops + active routes ──
-    const dropsParams = [range.from, range.to];
-    let dropsScopeFilter = '';
-    if (taxiNames !== null) {
-      dropsParams.push(taxiNames);
-      dropsScopeFilter = `AND unit_name = ANY($${dropsParams.length})`;
-    }
-    const { rows: [dropsRow] } = await pool.query(`
-      SELECT COUNT(*) AS delivered_drops,
-             COUNT(DISTINCT route_code) AS active_routes
-      FROM taxi_drop_point_log WHERE sup_date BETWEEN $1 AND $2 ${dropsScopeFilter}
-    `, dropsParams);
+    const dFilter = nameFilter ? `AND unit_name ${nameFilter.sql}` : '';
+    const dParams = nameFilter ? nameFilter.params : [];
 
-    // ── Planned drops ──
-    const plannedParams = [range.from, range.to];
-    let plannedScopeFilter = '';
-    if (taxiNames !== null) {
-      plannedParams.push(taxiNames);
-      plannedScopeFilter = `AND unit_name = ANY($${plannedParams.length})`;
-    }
-    const { rows: [plannedRow] } = await pool.query(`
+    const { rows: [dropsRow] } = await q(`
+      SELECT COUNT(*) AS delivered_drops, COUNT(DISTINCT route_code) AS active_routes
+      FROM taxi_drop_point_log WHERE sup_date BETWEEN ? AND ? ${dFilter}
+    `, [range.from, range.to, ...dParams]);
+
+    const { rows: [plannedRow] } = await q(`
       SELECT COUNT(*) AS planned_drops
       FROM drop_points_master
       WHERE route_code IN (
-        SELECT DISTINCT route_code
-        FROM taxi_drop_point_log
-        WHERE sup_date BETWEEN $1 AND $2 ${plannedScopeFilter}
+        SELECT DISTINCT route_code FROM taxi_drop_point_log
+        WHERE sup_date BETWEEN ? AND ? ${dFilter}
       )
-    `, plannedParams);
+    `, [range.from, range.to, ...dParams]);
 
-    // ── Per-unit breakdown ──
-    // The inner subquery (taxi_drop_point_log) and the outer WHERE (taxi_delay_log)
-    // each need their own date-range + optional scope param, so params differ by case.
     let unitsRows;
     if (taxiNames !== null) {
-      // params: $1,$2=range(inner), $3=taxiNames(inner), $4,$5=range(outer), $6=taxiNames(outer)
-      const { rows } = await pool.query(`
+      const ph = inClause(taxiNames);
+      const { rows } = await q(`
         SELECT d.unit_name,
           COUNT(*) AS routes,
-          COALESCE(SUM(d.supply), 0)::float AS supply,
-          SUM(CASE WHEN d.taxi_delayed <= interval '0' THEN 1 ELSE 0 END) AS on_time,
-          SUM(CASE WHEN d.taxi_delayed  > interval '0' THEN 1 ELSE 0 END) AS delayed,
-          COALESCE(ROUND(100.0 * SUM(CASE WHEN d.taxi_delayed <= interval '0' THEN 1 ELSE 0 END)::numeric
-            / NULLIF(COUNT(*),0), 1), 0)::float AS otd_pct,
-          COALESCE(SUM(d.total_app_km), 0)::float AS actual_km,
+          COALESCE(SUM(d.supply), 0) AS supply,
+          SUM(CASE WHEN COALESCE(d.taxi_delayed,1) <= 0 THEN 1 ELSE 0 END) AS on_time,
+          SUM(CASE WHEN COALESCE(d.taxi_delayed,1)  > 0 THEN 1 ELSE 0 END) AS delayed,
+          COALESCE(ROUND(100.0 * SUM(CASE WHEN COALESCE(d.taxi_delayed,1) <= 0 THEN 1 ELSE 0 END)
+            / NULLIF(COUNT(*),0), 1), 0) AS otd_pct,
+          COALESCE(SUM(d.total_app_km), 0) AS actual_km,
           COALESCE(dp_agg.delivered_drops, 0) AS delivered_drops
         FROM taxi_delay_log d
         LEFT JOIN (
           SELECT unit_name, COUNT(*) AS delivered_drops
           FROM taxi_drop_point_log
-          WHERE sup_date BETWEEN $1 AND $2 AND unit_name = ANY($3)
+          WHERE sup_date BETWEEN ? AND ? AND unit_name ${ph.sql}
           GROUP BY unit_name
         ) dp_agg ON dp_agg.unit_name = d.unit_name
-        WHERE d.report_date BETWEEN $4 AND $5 AND d.unit_name = ANY($6)
+        WHERE d.report_date BETWEEN ? AND ? AND d.unit_name ${ph.sql}
         GROUP BY d.unit_name, dp_agg.delivered_drops
         ORDER BY delayed DESC, d.unit_name
-      `, [range.from, range.to, taxiNames, range.from, range.to, taxiNames]);
+      `, [range.from, range.to, ...ph.params, range.from, range.to, ...ph.params]);
       unitsRows = rows;
     } else {
-      // Admin: no scope filter; params: $1,$2=range(inner), $3,$4=range(outer)
-      const { rows } = await pool.query(`
+      const { rows } = await q(`
         SELECT d.unit_name,
           COUNT(*) AS routes,
-          COALESCE(SUM(d.supply), 0)::float AS supply,
-          SUM(CASE WHEN d.taxi_delayed <= interval '0' THEN 1 ELSE 0 END) AS on_time,
-          SUM(CASE WHEN d.taxi_delayed  > interval '0' THEN 1 ELSE 0 END) AS delayed,
-          COALESCE(ROUND(100.0 * SUM(CASE WHEN d.taxi_delayed <= interval '0' THEN 1 ELSE 0 END)::numeric
-            / NULLIF(COUNT(*),0), 1), 0)::float AS otd_pct,
-          COALESCE(SUM(d.total_app_km), 0)::float AS actual_km,
+          COALESCE(SUM(d.supply), 0) AS supply,
+          SUM(CASE WHEN COALESCE(d.taxi_delayed,1) <= 0 THEN 1 ELSE 0 END) AS on_time,
+          SUM(CASE WHEN COALESCE(d.taxi_delayed,1)  > 0 THEN 1 ELSE 0 END) AS delayed,
+          COALESCE(ROUND(100.0 * SUM(CASE WHEN COALESCE(d.taxi_delayed,1) <= 0 THEN 1 ELSE 0 END)
+            / NULLIF(COUNT(*),0), 1), 0) AS otd_pct,
+          COALESCE(SUM(d.total_app_km), 0) AS actual_km,
           COALESCE(dp_agg.delivered_drops, 0) AS delivered_drops
         FROM taxi_delay_log d
         LEFT JOIN (
           SELECT unit_name, COUNT(*) AS delivered_drops
-          FROM taxi_drop_point_log
-          WHERE sup_date BETWEEN $1 AND $2
+          FROM taxi_drop_point_log WHERE sup_date BETWEEN ? AND ?
           GROUP BY unit_name
         ) dp_agg ON dp_agg.unit_name = d.unit_name
-        WHERE d.report_date BETWEEN $3 AND $4
+        WHERE d.report_date BETWEEN ? AND ?
         GROUP BY d.unit_name, dp_agg.delivered_drops
         ORDER BY delayed DESC, d.unit_name
       `, [range.from, range.to, range.from, range.to]);
@@ -675,9 +595,7 @@ app.get('/api/dashboard/routes', async (req, res) => {
     const hl = hlRaw && /^\d+$/.test(hlRaw) ? parseInt(hlRaw, 10) : 1;
 
     if (!range) {
-      const { rows } = await pool.query(
-        "SELECT MAX(report_date)::text AS max FROM taxi_delay_log"
-      );
+      const { rows } = await q("SELECT DATE_FORMAT(MAX(report_date),'%Y-%m-%d') AS max FROM taxi_delay_log");
       const d = (rows[0] && rows[0].max) ? rows[0].max : '';
       range = { from: d, to: d };
     }
@@ -691,16 +609,17 @@ app.get('/api/dashboard/routes', async (req, res) => {
       }
     }
 
-    const { rows } = await pool.query(`
-      SELECT report_date::text AS report_date,
+    const { rows } = await q(`
+      SELECT DATE_FORMAT(report_date,'%Y-%m-%d') AS report_date,
              route_name, sub_route_name, taxi_type, bundles, supply, vehicle_no, is_regular,
-             scheduled_departure::text, actual_departure::text,
-             ROUND(EXTRACT(EPOCH FROM COALESCE(taxi_delayed, interval '0'))/60, 0)::float AS delay_minutes,
-             COALESCE(route_master_km, 0)::float AS planned_km,
-             COALESCE(total_app_km, 0)::float AS actual_km,
-             (taxi_delayed > interval '0') AS is_delayed
+             TIME_FORMAT(scheduled_departure,'%H:%i') AS scheduled_departure,
+             TIME_FORMAT(actual_departure,'%H:%i') AS actual_departure,
+             ROUND(COALESCE(taxi_delayed, 0) / 60, 0) AS delay_minutes,
+             COALESCE(route_master_km, 0) AS planned_km,
+             COALESCE(total_app_km, 0) AS actual_km,
+             (COALESCE(taxi_delayed, 0) > 0) AS is_delayed
       FROM taxi_delay_log
-      WHERE report_date BETWEEN $1 AND $2 AND unit_name = $3
+      WHERE report_date BETWEEN ? AND ? AND unit_name = ?
       ORDER BY report_date DESC, is_delayed DESC, route_name
     `, [range.from, range.to, unit_name]);
 
@@ -720,9 +639,7 @@ app.get('/api/dashboard/drop-points', async (req, res) => {
     const hl = hlRaw && /^\d+$/.test(hlRaw) ? parseInt(hlRaw, 10) : 1;
 
     if (!range) {
-      const { rows } = await pool.query(
-        "SELECT MAX(sup_date)::text AS max FROM taxi_drop_point_log"
-      );
+      const { rows } = await q("SELECT DATE_FORMAT(MAX(sup_date),'%Y-%m-%d') AS max FROM taxi_drop_point_log");
       const d = (rows[0] && rows[0].max) ? rows[0].max : '';
       range = { from: d, to: d };
     }
@@ -733,28 +650,27 @@ app.get('/api/dashboard/drop-points', async (req, res) => {
     const unitCodes = await getScopeUnitCodes(personCode, hl);
     if (unitCodes !== null) {
       const taxiNames = await scopeToTaxiNames(unitCodes);
-      const { rows: rrows } = await pool.query(
-        'SELECT unit_name FROM taxi_delay_log WHERE route_name = $1 LIMIT 1',
-        [routeName]
-      );
+      const { rows: rrows } = await q('SELECT unit_name FROM taxi_delay_log WHERE route_name = ? LIMIT 1', [routeName]);
       if (rrows.length && !taxiNames.includes(rrows[0].unit_name)) {
-        return res.json({
-          date, route_name: routeName,
-          delivered_count: 0, missed_count: 0, drop_points: [],
-        });
+        return res.json({ date, route_name: routeName, delivered_count: 0, missed_count: 0, drop_points: [] });
       }
     }
 
-    const { rows } = await pool.query(`
-      SELECT sup_date::text AS sup_date, drop_point_name,
-             scheduled_arrival::text, actual_arrival::text,
-             ROUND(EXTRACT(EPOCH FROM COALESCE(time_diff, interval '0'))/60, 0)::float AS diff_minutes,
-             actual_lat::float, actual_long::float,
+    const { rows } = await q(`
+      SELECT DATE_FORMAT(sup_date,'%Y-%m-%d') AS sup_date, drop_point_name,
+             TIME_FORMAT(scheduled_arrival,'%H:%i') AS scheduled_arrival,
+             TIME_FORMAT(actual_arrival,'%H:%i') AS actual_arrival,
+             ROUND(COALESCE(time_diff, 0) / 60, 0) AS diff_minutes,
+             actual_lat, actual_long,
              CASE WHEN actual_lat IS NOT NULL AND actual_long IS NOT NULL
                   THEN 'delivered' ELSE 'missed' END AS status
       FROM taxi_drop_point_log
-      WHERE sup_date BETWEEN $1 AND $2 AND route_name = $3
-      ORDER BY sup_date DESC, actual_arrival NULLS LAST, scheduled_arrival NULLS LAST
+      WHERE sup_date BETWEEN ? AND ? AND route_name = ?
+      ORDER BY sup_date DESC,
+               CASE WHEN actual_arrival IS NULL THEN 1 ELSE 0 END,
+               actual_arrival,
+               CASE WHEN scheduled_arrival IS NULL THEN 1 ELSE 0 END,
+               scheduled_arrival
     `, [range.from, range.to, routeName]);
 
     const allDrops = rows.map(_clean);
@@ -797,72 +713,67 @@ app.get('/api/dashboard/outstanding', async (req, res) => {
     const hlRaw = req.headers['x-hierarchy-level'];
     const hl = hlRaw && /^\d+$/.test(hlRaw) ? parseInt(hlRaw, 10) : 1;
 
-    // Outstanding is a snapshot (closing balances) — for a range, use the
-    // latest report available within it rather than summing snapshots.
     let date;
     if (range) {
-      const { rows } = await pool.query(
-        "SELECT MAX(report_date)::text AS max FROM agency_outstanding WHERE report_date BETWEEN $1 AND $2",
+      const { rows } = await q(
+        "SELECT DATE_FORMAT(MAX(report_date),'%Y-%m-%d') AS max FROM agency_outstanding WHERE report_date BETWEEN ? AND ?",
         [range.from, range.to]
       );
       date = (rows[0] && rows[0].max) ? rows[0].max : '';
     } else {
-      const { rows } = await pool.query(
-        "SELECT MAX(report_date)::text AS max FROM agency_outstanding"
-      );
+      const { rows } = await q("SELECT DATE_FORMAT(MAX(report_date),'%Y-%m-%d') AS max FROM agency_outstanding");
       date = (rows[0] && rows[0].max) ? rows[0].max : '';
     }
     if (!date) return res.json({ date, summary: {}, units: [] });
 
     const unitCodes = await getScopeUnitCodes(personCode, hl);
     let scopeFilter = '';
-    let scopeParams = []; // will be [] or [aoNames]
+    let scopeParams = [];
 
     if (unitCodes === null) {
       // Admin: no filter
     } else if (unitCodes.length === 0) {
       return res.json({ date, summary: {}, units: [] });
     } else {
-      // Resolve unit names used in agency_outstanding table
-      const placeholders = unitCodes.map((_, i) => `$${i + 1}`).join(',');
-      const { rows: aoRows } = await pool.query(`
+      const ph = inClause(unitCodes);
+      const { rows: aoRows } = await q(`
         SELECT DISTINCT ao.unit_name FROM agency_outstanding ao
         JOIN units u ON (
-          ao.unit_name = u.unit_name OR ao.unit_name = u.unit_name || ' RP'
-          OR ao.unit_name = u.unit_name || ' PT' OR ao.unit_name = u.unit_name || ' DN'
+          ao.unit_name = u.unit_name OR ao.unit_name = CONCAT(u.unit_name, ' RP')
+          OR ao.unit_name = CONCAT(u.unit_name, ' PT') OR ao.unit_name = CONCAT(u.unit_name, ' DN')
         )
-        WHERE u.unit_code IN (${placeholders})
-      `, unitCodes);
+        WHERE u.unit_code ${ph.sql}
+      `, ph.params);
       const aoNames = aoRows.map((r) => r.unit_name);
       if (!aoNames.length) return res.json({ date, summary: {}, units: [] });
-      scopeFilter = 'AND unit_name = ANY($2)';
-      scopeParams = [aoNames];
+      const nph = inClause(aoNames);
+      scopeFilter = `AND unit_name ${nph.sql}`;
+      scopeParams = nph.params;
     }
 
-    // queryParams: [date, ...scopeParams]  →  [date] or [date, aoNames]
     const queryParams = [date, ...scopeParams];
 
-    const { rows: [summaryRow] } = await pool.query(`
+    const { rows: [summaryRow] } = await q(`
       SELECT COUNT(*) AS total_agencies,
           SUM(CASE WHEN COALESCE(closing_debit,0) > 0 THEN 1 ELSE 0 END) AS outstanding_agencies,
-          COALESCE(SUM(closing_debit), 0)::float AS total_outstanding,
-          COALESCE(SUM(closing_credit), 0)::float AS total_advance,
-          COALESCE(SUM(bill_amount), 0)::float AS total_bill,
-          COALESCE(SUM(receipt_amount), 0)::float AS total_collected,
-          COALESCE(ROUND(AVG(collection_pct), 1), 0)::float AS avg_collection_pct
-      FROM agency_outstanding WHERE report_date = $1 ${scopeFilter}
+          COALESCE(SUM(closing_debit), 0) AS total_outstanding,
+          COALESCE(SUM(closing_credit), 0) AS total_advance,
+          COALESCE(SUM(bill_amount), 0) AS total_bill,
+          COALESCE(SUM(receipt_amount), 0) AS total_collected,
+          COALESCE(ROUND(AVG(collection_pct), 1), 0) AS avg_collection_pct
+      FROM agency_outstanding WHERE report_date = ? ${scopeFilter}
     `, queryParams);
 
-    const { rows: unitsRows } = await pool.query(`
+    const { rows: unitsRows } = await q(`
       SELECT unit_name,
           COUNT(*) AS agency_count,
           SUM(CASE WHEN COALESCE(closing_debit,0) > 0 THEN 1 ELSE 0 END) AS outstanding_count,
-          COALESCE(SUM(closing_debit), 0)::float AS outstanding,
-          COALESCE(SUM(closing_credit), 0)::float AS advance,
-          COALESCE(SUM(bill_amount), 0)::float AS bill_amount,
-          COALESCE(SUM(receipt_amount), 0)::float AS collected,
-          COALESCE(ROUND(AVG(collection_pct), 1), 0)::float AS avg_collection_pct
-      FROM agency_outstanding WHERE report_date = $1 ${scopeFilter}
+          COALESCE(SUM(closing_debit), 0) AS outstanding,
+          COALESCE(SUM(closing_credit), 0) AS advance,
+          COALESCE(SUM(bill_amount), 0) AS bill_amount,
+          COALESCE(SUM(receipt_amount), 0) AS collected,
+          COALESCE(ROUND(AVG(collection_pct), 1), 0) AS avg_collection_pct
+      FROM agency_outstanding WHERE report_date = ? ${scopeFilter}
       GROUP BY unit_name ORDER BY outstanding DESC
     `, queryParams);
 
@@ -885,58 +796,54 @@ app.get('/api/dashboard/outstanding/agencies', async (req, res) => {
     const hlRaw = req.headers['x-hierarchy-level'];
     const hl = hlRaw && /^\d+$/.test(hlRaw) ? parseInt(hlRaw, 10) : 1;
 
-    // Snapshot data: use latest report within the range (or overall latest)
     let date;
     if (range) {
-      const { rows } = await pool.query(
-        "SELECT MAX(report_date)::text AS max FROM agency_outstanding WHERE report_date BETWEEN $1 AND $2",
+      const { rows } = await q(
+        "SELECT DATE_FORMAT(MAX(report_date),'%Y-%m-%d') AS max FROM agency_outstanding WHERE report_date BETWEEN ? AND ?",
         [range.from, range.to]
       );
       date = (rows[0] && rows[0].max) ? rows[0].max : '';
     } else {
-      const { rows } = await pool.query(
-        "SELECT MAX(report_date)::text AS max FROM agency_outstanding"
-      );
+      const { rows } = await q("SELECT DATE_FORMAT(MAX(report_date),'%Y-%m-%d') AS max FROM agency_outstanding");
       date = (rows[0] && rows[0].max) ? rows[0].max : '';
     }
     if (!date) return res.json({ date, unit_name, agencies: [] });
 
     const unitCodes = await getScopeUnitCodes(personCode, hl);
     if (unitCodes !== null && unitCodes.length > 0) {
-      // $1 = unit_name, $2..$N = unitCodes
-      const placeholders = unitCodes.map((_, i) => `$${i + 2}`).join(',');
-      const { rows: checkRows } = await pool.query(`
+      const ph = inClause(unitCodes);
+      const { rows: checkRows } = await q(`
         SELECT 1 FROM agency_outstanding ao
         JOIN units u ON (
-          ao.unit_name = u.unit_name OR ao.unit_name = u.unit_name || ' RP'
-          OR ao.unit_name = u.unit_name || ' PT' OR ao.unit_name = u.unit_name || ' DN'
+          ao.unit_name = u.unit_name OR ao.unit_name = CONCAT(u.unit_name, ' RP')
+          OR ao.unit_name = CONCAT(u.unit_name, ' PT') OR ao.unit_name = CONCAT(u.unit_name, ' DN')
         )
-        WHERE ao.unit_name = $1 AND u.unit_code IN (${placeholders}) LIMIT 1
-      `, [unit_name, ...unitCodes]);
+        WHERE ao.unit_name = ? AND u.unit_code ${ph.sql} LIMIT 1
+      `, [unit_name, ...ph.params]);
       if (!checkRows.length) return res.json({ date, unit_name, agencies: [] });
     }
 
-    const { rows } = await pool.query(`
+    const { rows } = await q(`
       SELECT ag_code, agency_name, executive, status, drop_point, district, zonal_head,
              total_copies, daily_copies,
-             COALESCE(security_deposit, 0)::float AS security_deposit,
-             COALESCE(required_security, 0)::float AS required_security,
-             COALESCE(security_diff, 0)::float AS security_diff,
-             COALESCE(opening_debit, 0)::float AS opening_debit,
-             COALESCE(opening_credit, 0)::float AS opening_credit,
-             COALESCE(bill_amount, 0)::float AS bill_amount,
-             COALESCE(other_debits, 0)::float AS other_debits,
-             COALESCE(receipt_amount, 0)::float AS receipt_amount,
-             COALESCE(other_credits, 0)::float AS other_credits,
-             COALESCE(closing_debit, 0)::float AS closing_debit,
-             COALESCE(closing_credit, 0)::float AS closing_credit,
-             COALESCE(collection_pct, 0)::float AS collection_pct,
+             COALESCE(security_deposit, 0) AS security_deposit,
+             COALESCE(required_security, 0) AS required_security,
+             COALESCE(security_diff, 0) AS security_diff,
+             COALESCE(opening_debit, 0) AS opening_debit,
+             COALESCE(opening_credit, 0) AS opening_credit,
+             COALESCE(bill_amount, 0) AS bill_amount,
+             COALESCE(other_debits, 0) AS other_debits,
+             COALESCE(receipt_amount, 0) AS receipt_amount,
+             COALESCE(other_credits, 0) AS other_credits,
+             COALESCE(closing_debit, 0) AS closing_debit,
+             COALESCE(closing_credit, 0) AS closing_credit,
+             COALESCE(collection_pct, 0) AS collection_pct,
              mobile_no, agency_type,
-             supply_start_date::text, supply_days,
-             last_supply_date::text, last_supply_post
+             DATE_FORMAT(supply_start_date,'%Y-%m-%d') AS supply_start_date, supply_days,
+             DATE_FORMAT(last_supply_date,'%Y-%m-%d') AS last_supply_date, last_supply_post
       FROM agency_outstanding
-      WHERE report_date = $1 AND unit_name = $2
-      ORDER BY closing_debit DESC NULLS LAST, agency_name
+      WHERE report_date = ? AND unit_name = ?
+      ORDER BY CASE WHEN closing_debit IS NULL THEN 1 ELSE 0 END, closing_debit DESC, agency_name
     `, [date, unit_name]);
 
     res.json({ date, unit_name, agencies: rows.map(_clean) });
@@ -956,9 +863,7 @@ app.get('/api/dashboard/supply', async (req, res) => {
     const hl = hlRaw && /^\d+$/.test(hlRaw) ? parseInt(hlRaw, 10) : 1;
 
     if (!range) {
-      const { rows } = await pool.query(
-        "SELECT MAX(supply_date)::text AS max FROM daily_supply"
-      );
+      const { rows } = await q("SELECT DATE_FORMAT(MAX(supply_date),'%Y-%m-%d') AS max FROM daily_supply");
       const d = (rows[0] && rows[0].max) ? rows[0].max : '';
       if (!d) return res.json({ date: '', summary: {}, units: [] });
       range = { from: d, to: d };
@@ -974,37 +879,38 @@ app.get('/api/dashboard/supply', async (req, res) => {
     } else if (unitCodes.length === 0) {
       return res.json({ date, summary: {}, units: [] });
     } else {
-      const placeholders = unitCodes.map((_, i) => `$${i + 1}`).join(',');
-      const { rows: scopeRows } = await pool.query(`
+      const ph = inClause(unitCodes);
+      const { rows: scopeRows } = await q(`
         SELECT DISTINCT ds.unit_name FROM daily_supply ds
         JOIN units u ON (
-          ds.unit_name = u.unit_name OR ds.unit_name = u.unit_name || ' RP'
-          OR ds.unit_name = u.unit_name || ' PT' OR ds.unit_name = u.unit_name || ' DN'
+          ds.unit_name = u.unit_name OR ds.unit_name = CONCAT(u.unit_name, ' RP')
+          OR ds.unit_name = CONCAT(u.unit_name, ' PT') OR ds.unit_name = CONCAT(u.unit_name, ' DN')
         )
-        WHERE u.unit_code IN (${placeholders})
-      `, unitCodes);
+        WHERE u.unit_code ${ph.sql}
+      `, ph.params);
       const scopeNames = scopeRows.map((r) => r.unit_name);
       if (!scopeNames.length) return res.json({ date, summary: {}, units: [] });
-      scopeFilter = 'AND unit_name = ANY($3)';
-      scopeParams = [scopeNames];
+      const nph = inClause(scopeNames);
+      scopeFilter = `AND unit_name ${nph.sql}`;
+      scopeParams = nph.params;
     }
 
     const queryParams = [range.from, range.to, ...scopeParams];
 
-    const { rows: [summaryRow] } = await pool.query(`
+    const { rows: [summaryRow] } = await q(`
       SELECT COUNT(DISTINCT ag_code) AS total_agencies,
-          COALESCE(SUM(copies_supplied), 0)::float AS total_copies,
-          COALESCE(AVG(copies_supplied), 0)::float AS avg_copies,
+          COALESCE(SUM(copies_supplied), 0) AS total_copies,
+          COALESCE(AVG(copies_supplied), 0) AS avg_copies,
           COUNT(DISTINCT CASE WHEN copies_supplied > 0 THEN ag_code END) AS active_agencies
-      FROM daily_supply WHERE supply_date BETWEEN $1 AND $2 ${scopeFilter}
+      FROM daily_supply WHERE supply_date BETWEEN ? AND ? ${scopeFilter}
     `, queryParams);
 
-    const { rows: unitsRows } = await pool.query(`
+    const { rows: unitsRows } = await q(`
       SELECT unit_name,
           COUNT(DISTINCT ag_code) AS agencies,
-          COALESCE(SUM(copies_supplied), 0)::float AS total_copies,
-          COALESCE(AVG(copies_supplied), 0)::float AS avg_copies
-      FROM daily_supply WHERE supply_date BETWEEN $1 AND $2 ${scopeFilter}
+          COALESCE(SUM(copies_supplied), 0) AS total_copies,
+          COALESCE(AVG(copies_supplied), 0) AS avg_copies
+      FROM daily_supply WHERE supply_date BETWEEN ? AND ? ${scopeFilter}
       GROUP BY unit_name ORDER BY total_copies DESC
     `, queryParams);
 
@@ -1028,9 +934,7 @@ app.get('/api/dashboard/supply/agencies', async (req, res) => {
     const hl = hlRaw && /^\d+$/.test(hlRaw) ? parseInt(hlRaw, 10) : 1;
 
     if (!range) {
-      const { rows } = await pool.query(
-        "SELECT MAX(supply_date)::text AS max FROM daily_supply"
-      );
+      const { rows } = await q("SELECT DATE_FORMAT(MAX(supply_date),'%Y-%m-%d') AS max FROM daily_supply");
       const d = (rows[0] && rows[0].max) ? rows[0].max : '';
       range = { from: d, to: d };
     }
@@ -1038,26 +942,26 @@ app.get('/api/dashboard/supply/agencies', async (req, res) => {
 
     const unitCodes = await getScopeUnitCodes(personCode, hl);
     if (unitCodes !== null && unitCodes.length > 0) {
-      const placeholders = unitCodes.map((_, i) => `$${i + 2}`).join(',');
-      const { rows: checkRows } = await pool.query(`
+      const ph = inClause(unitCodes);
+      const { rows: checkRows } = await q(`
         SELECT 1 FROM daily_supply ds
         JOIN units u ON (
-          ds.unit_name = u.unit_name OR ds.unit_name = u.unit_name || ' RP'
-          OR ds.unit_name = u.unit_name || ' PT' OR ds.unit_name = u.unit_name || ' DN'
+          ds.unit_name = u.unit_name OR ds.unit_name = CONCAT(u.unit_name, ' RP')
+          OR ds.unit_name = CONCAT(u.unit_name, ' PT') OR ds.unit_name = CONCAT(u.unit_name, ' DN')
         )
-        WHERE ds.unit_name = $1 AND u.unit_code IN (${placeholders}) LIMIT 1
-      `, [unit_name, ...unitCodes]);
+        WHERE ds.unit_name = ? AND u.unit_code ${ph.sql} LIMIT 1
+      `, [unit_name, ...ph.params]);
       if (!checkRows.length) return res.json({ date, unit_name, agencies: [] });
     }
 
-    const { rows } = await pool.query(`
+    const { rows } = await q(`
       SELECT ag_code, MAX(agency_name) AS agency_name, MAX(executive) AS executive,
              MAX(zonal_head) AS zonal_head,
-             COALESCE(SUM(copies_supplied), 0)::float AS copies_supplied
+             COALESCE(SUM(copies_supplied), 0) AS copies_supplied
       FROM daily_supply
-      WHERE supply_date BETWEEN $1 AND $2 AND unit_name = $3
+      WHERE supply_date BETWEEN ? AND ? AND unit_name = ?
       GROUP BY ag_code
-      ORDER BY copies_supplied DESC NULLS LAST, agency_name
+      ORDER BY CASE WHEN copies_supplied IS NULL THEN 1 ELSE 0 END, copies_supplied DESC, agency_name
     `, [range.from, range.to, unit_name]);
 
     res.json({ date, from: range.from, to: range.to, unit_name, agencies: rows.map(_clean) });
@@ -1077,9 +981,7 @@ app.get('/api/dashboard/collection', async (req, res) => {
     const hl = hlRaw && /^\d+$/.test(hlRaw) ? parseInt(hlRaw, 10) : 1;
 
     if (!range) {
-      const { rows } = await pool.query(
-        "SELECT MAX(collection_date)::text AS max FROM daily_collection"
-      );
+      const { rows } = await q("SELECT DATE_FORMAT(MAX(collection_date),'%Y-%m-%d') AS max FROM daily_collection");
       const d = (rows[0] && rows[0].max) ? rows[0].max : '';
       if (!d) return res.json({ date: '', summary: {}, units: [] });
       range = { from: d, to: d };
@@ -1095,45 +997,46 @@ app.get('/api/dashboard/collection', async (req, res) => {
     } else if (unitCodes.length === 0) {
       return res.json({ date, summary: {}, units: [] });
     } else {
-      const placeholders = unitCodes.map((_, i) => `$${i + 1}`).join(',');
-      const { rows: scopeRows } = await pool.query(`
+      const ph = inClause(unitCodes);
+      const { rows: scopeRows } = await q(`
         SELECT DISTINCT dc.unit_name FROM daily_collection dc
         JOIN units u ON (
-          dc.unit_name = u.unit_name OR dc.unit_name = u.unit_name || ' RP'
-          OR dc.unit_name = u.unit_name || ' PT' OR dc.unit_name = u.unit_name || ' DN'
+          dc.unit_name = u.unit_name OR dc.unit_name = CONCAT(u.unit_name, ' RP')
+          OR dc.unit_name = CONCAT(u.unit_name, ' PT') OR dc.unit_name = CONCAT(u.unit_name, ' DN')
         )
-        WHERE u.unit_code IN (${placeholders})
-      `, unitCodes);
+        WHERE u.unit_code ${ph.sql}
+      `, ph.params);
       const scopeNames = scopeRows.map((r) => r.unit_name);
       if (!scopeNames.length) return res.json({ date, summary: {}, units: [] });
-      scopeFilter = 'AND unit_name = ANY($3)';
-      scopeParams = [scopeNames];
+      const nph = inClause(scopeNames);
+      scopeFilter = `AND unit_name ${nph.sql}`;
+      scopeParams = nph.params;
     }
 
     const queryParams = [range.from, range.to, ...scopeParams];
 
-    const { rows: [summaryRow] } = await pool.query(`
+    const { rows: [summaryRow] } = await q(`
       SELECT COUNT(*) AS total_transactions,
-          COALESCE(SUM(amount), 0)::float AS total_collected,
-          COALESCE(SUM(CASE WHEN sale_type='CREDIT' THEN amount END), 0)::float AS credit_collection,
-          COALESCE(SUM(CASE WHEN sale_type='CASH' THEN amount END), 0)::float AS cash_collection,
+          COALESCE(SUM(amount), 0) AS total_collected,
+          COALESCE(SUM(CASE WHEN sale_type='CREDIT' THEN amount END), 0) AS credit_collection,
+          COALESCE(SUM(CASE WHEN sale_type='CASH' THEN amount END), 0) AS cash_collection,
           COALESCE(SUM(CASE WHEN payment_mode IN ('UPI','NEFT','CHEQUE','GATEWAY','DEMAND DRAFT')
-            THEN amount END), 0)::float AS digital_collection,
-          COALESCE(SUM(CASE WHEN payment_mode='CASH' THEN amount END), 0)::float AS physical_cash,
+            THEN amount END), 0) AS digital_collection,
+          COALESCE(SUM(CASE WHEN payment_mode='CASH' THEN amount END), 0) AS physical_cash,
           COUNT(DISTINCT ag_code) AS agencies_paid
-      FROM daily_collection WHERE collection_date BETWEEN $1 AND $2 ${scopeFilter}
+      FROM daily_collection WHERE collection_date BETWEEN ? AND ? ${scopeFilter}
     `, queryParams);
 
-    const { rows: unitsRows } = await pool.query(`
+    const { rows: unitsRows } = await q(`
       SELECT unit_name,
           COUNT(*) AS transactions,
-          COALESCE(SUM(amount), 0)::float AS total_collected,
-          COALESCE(SUM(CASE WHEN sale_type='CREDIT' THEN amount END), 0)::float AS credit_collection,
-          COALESCE(SUM(CASE WHEN sale_type='CASH' THEN amount END), 0)::float AS cash_collection,
+          COALESCE(SUM(amount), 0) AS total_collected,
+          COALESCE(SUM(CASE WHEN sale_type='CREDIT' THEN amount END), 0) AS credit_collection,
+          COALESCE(SUM(CASE WHEN sale_type='CASH' THEN amount END), 0) AS cash_collection,
           COALESCE(SUM(CASE WHEN payment_mode IN ('UPI','NEFT','CHEQUE','GATEWAY','DEMAND DRAFT')
-            THEN amount END), 0)::float AS digital_collection,
+            THEN amount END), 0) AS digital_collection,
           COUNT(DISTINCT ag_code) AS agencies_paid
-      FROM daily_collection WHERE collection_date BETWEEN $1 AND $2 ${scopeFilter}
+      FROM daily_collection WHERE collection_date BETWEEN ? AND ? ${scopeFilter}
       GROUP BY unit_name ORDER BY total_collected DESC
     `, queryParams);
 

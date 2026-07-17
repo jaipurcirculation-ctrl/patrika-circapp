@@ -1,13 +1,13 @@
 'use strict';
 
 /**
- * oracle_sync.js — Pulls daily taxi drop-point data from Oracle ERP → PostgreSQL
+ * oracle_sync.js — Pulls daily taxi drop-point data from Oracle ERP → MySQL
  *
  * The Oracle server is 11g (11.2.0.3), which node-oracledb thin mode does not
  * support, and no Oracle client install is wanted on this machine. So this
  * script uses the existing 32-bit sqlplus.exe from the local Oracle XE install
  * to run the query and spool delimited output, then parses it and loads it
- * into PostgreSQL.
+ * into MySQL.
  *
  * Usage:
  *   node api/oracle_sync.js               # syncs yesterday
@@ -17,7 +17,7 @@
  */
 
 const { spawn } = require('child_process');
-const { Client } = require('pg');
+const mysql = require('mysql2/promise');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -26,12 +26,12 @@ require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 const SQLPLUS = process.env.SQLPLUS_PATH ||
   'C:\\oraclexe\\app\\oracle\\product\\11.2.0\\server\\bin\\sqlplus.exe';
 
-const PG_CONFIG = {
-  host:     process.env.DB_HOST     || 'localhost',
-  port:     parseInt(process.env.DB_PORT || '5432', 10),
-  database: process.env.DB_NAME     || 'patrika_vitran',
-  user:     process.env.DB_USER     || 'postgres',
-  password: process.env.DB_PASSWORD || '',
+const MYSQL_CONFIG = {
+  host:     process.env.MYSQL_HOST     || 'localhost',
+  port:     parseInt(process.env.MYSQL_PORT || '3306', 10),
+  database: process.env.MYSQL_DB       || 'patrika_vitran',
+  user:     process.env.MYSQL_USER     || 'root',
+  password: process.env.MYSQL_PASSWORD || '',
 };
 
 const LOG_FILE = path.resolve(__dirname, '../logs/oracle_sync.log');
@@ -108,18 +108,16 @@ function toTime(v) {
   return null;
 }
 
-// Normalize to valid PostgreSQL interval 'HH:MM:SS' (handles overflow minutes)
-function toInterval(v) {
+// Convert 'HH:MM' or 'HH:MM:SS' (with optional leading '-') → signed integer seconds
+// MySQL stores time_diff as INT NULL (positive = late, negative = early)
+function toIntervalSecs(v) {
   const t = str(v);
   if (!t) return null;
   const m = t.match(/^(-?)(\d+):(\d+)(?::(\d+))?$/);
   if (!m) return null;
   const neg = m[1] === '-';
   const totalSec = parseInt(m[2], 10) * 3600 + parseInt(m[3], 10) * 60 + (m[4] ? parseInt(m[4], 10) : 0);
-  const h  = String(Math.floor(totalSec / 3600)).padStart(2, '0');
-  const mi = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
-  const sc = String(totalSec % 60).padStart(2, '0');
-  return `${neg ? '-' : ''}${h}:${mi}:${sc}`;
+  return neg ? -totalSec : totalSec;
 }
 
 // ── Build the Oracle SQL script for sqlplus ───────────────────────────────────
@@ -260,47 +258,47 @@ function runSqlplus(sqlFile) {
   });
 }
 
-// ── Map one parsed line → PostgreSQL INSERT params (31 columns) ──────────────
+// ── Map one parsed line → MySQL INSERT params (31 columns) ───────────────────
 function lineToParams(f) {
   return [
-    str(f[0]),                    //  1. unit_name
-    toDate(f[1]),                 //  2. sup_date
-    str(f[2]),                    //  3. driver_mobile (driver code from ERP)
-    str(f[3]),                    //  4. vehicle_no
-    str(f[4]),                    //  5. taxi_route_type (MAIN / LINK)
-    str(f[5]),                    //  6. route_code
-    str(f[6]),                    //  7. route_name
-    str(f[7]),                    //  8. sub_route_code
-    str(f[8]),                    //  9. sub_route_name
-    str(f[9]),                    // 10. drop_point_name
-    toInt(f[10]),                 // 11. no_of_packets
-    toDate(f[11]),                // 12. packet_drop_date
-    toTime(f[12]),                // 13. scheduled_arrival
-    toTime(f[13]),                // 14. actual_arrival
-    toInterval(f[14]),            // 15. time_diff
-    str(f[15]),                   // 16. taxi_id
-    num(f[16]),                   // 17. reg_lat
-    num(f[17]),                   // 18. reg_long
-    num(f[18]),                   // 19. actual_lat
-    num(f[19]),                   // 20. actual_long
-    num(f[20]),                   // 21. dist_diff
-    num(f[21]),                   // 22. route_master_km
-    num(f[22]),                   // 23. return_km
-    num(f[23]),                   // 24. actual_km
-    num(f[24]),                   // 25. total_distance
-    null,                         // 26. duration (not provided by ERP query)
-    str(f[25]),                   // 27. lat_long_addr
-    null,                         // 28. api_distance (not provided)
-    str(f[26]) === 'Y',           // 29. vehicle_sharing
-    null,                         // 30. last_drop_point (not provided)
-    str(f[27]),                   // 31. dropping_lat_long
+    str(f[0]),                         //  1. unit_name
+    toDate(f[1]),                      //  2. sup_date
+    str(f[2]),                         //  3. driver_mobile (driver code from ERP)
+    str(f[3]),                         //  4. vehicle_no
+    str(f[4]),                         //  5. taxi_route_type (MAIN / LINK)
+    str(f[5]),                         //  6. route_code
+    str(f[6]),                         //  7. route_name
+    str(f[7]),                         //  8. sub_route_code
+    str(f[8]),                         //  9. sub_route_name
+    str(f[9]),                         // 10. drop_point_name
+    toInt(f[10]),                      // 11. no_of_packets
+    toDate(f[11]),                     // 12. packet_drop_date
+    toTime(f[12]),                     // 13. scheduled_arrival
+    toTime(f[13]),                     // 14. actual_arrival
+    toIntervalSecs(f[14]),             // 15. time_diff (INT seconds)
+    str(f[15]),                        // 16. taxi_id
+    num(f[16]),                        // 17. reg_lat
+    num(f[17]),                        // 18. reg_long
+    num(f[18]),                        // 19. actual_lat
+    num(f[19]),                        // 20. actual_long
+    num(f[20]),                        // 21. dist_diff
+    num(f[21]),                        // 22. route_master_km
+    num(f[22]),                        // 23. return_km
+    num(f[23]),                        // 24. actual_km
+    num(f[24]),                        // 25. total_distance
+    null,                              // 26. duration (not provided by ERP query)
+    str(f[25]),                        // 27. lat_long_addr
+    null,                              // 28. api_distance (not provided)
+    str(f[26]) === 'Y' ? 1 : 0,       // 29. vehicle_sharing (TINYINT)
+    null,                              // 30. last_drop_point (not provided)
+    str(f[27]),                        // 31. dropping_lat_long
   ];
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   const syncDate = getSyncDate();
-  log(`=== Oracle → PostgreSQL sync started | date: ${syncDate} ===`);
+  log(`=== Oracle → MySQL sync started | date: ${syncDate} ===`);
 
   for (const k of ['ORA_HOST', 'ORA_SERVICE', 'ORA_USER', 'ORA_PASSWORD']) {
     if (!process.env[k]) {
@@ -316,7 +314,7 @@ async function main() {
   const tmpDir    = fs.mkdtempSync(path.join(os.tmpdir(), 'patrika-sync-'));
   const sqlFile   = path.join(tmpDir, 'query.sql');
   const spoolFile = path.join(tmpDir, 'data.txt');
-  const pgClient  = new Client(PG_CONFIG);
+  const conn      = await mysql.createConnection(MYSQL_CONFIG);
 
   try {
     // ── Run Oracle query via sqlplus ─────────────────────────────────────────
@@ -347,13 +345,12 @@ async function main() {
     }
     if (badLines > 0) log(`WARNING: skipped ${badLines} malformed lines`);
 
-    // ── Load into PostgreSQL ─────────────────────────────────────────────────
-    await pgClient.connect();
-    await pgClient.query('BEGIN');
+    // ── Load into MySQL ──────────────────────────────────────────────────────
+    await conn.beginTransaction();
 
-    const delRes = await pgClient.query(
-      'DELETE FROM taxi_drop_point_log WHERE sup_date = $1', [syncDate]);
-    log(`Deleted ${delRes.rowCount} existing rows for ${syncDate}`);
+    const [delRes] = await conn.execute(
+      'DELETE FROM taxi_drop_point_log WHERE sup_date = ?', [syncDate]);
+    log(`Deleted ${delRes.affectedRows} existing rows for ${syncDate}`);
 
     // Upsert routes
     const routeMap = new Map();
@@ -362,10 +359,10 @@ async function main() {
       if (rc && rn) routeMap.set(rc, rn);
     }
     for (const [rc, rn] of routeMap) {
-      await pgClient.query(
+      await conn.execute(
         `INSERT INTO routes (route_code, route_name)
-         VALUES ($1,$2)
-         ON CONFLICT (route_code) DO UPDATE SET route_name = EXCLUDED.route_name`,
+         VALUES (?,?)
+         ON DUPLICATE KEY UPDATE route_name = VALUES(route_name)`,
         [rc, rn]);
     }
     log(`Upserted ${routeMap.size} routes`);
@@ -380,14 +377,13 @@ async function main() {
          dist_diff, route_master_km, return_km, actual_km,
          total_distance, duration, lat_long_addr, api_distance,
          vehicle_sharing, last_drop_point, dropping_lat_long)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-              $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `;
 
     let inserted = 0, errors = 0;
     for (const f of parsed) {
       try {
-        await pgClient.query(insertSQL, lineToParams(f));
+        await conn.execute(insertSQL, lineToParams(f));
         inserted++;
       } catch (err) {
         errors++;
@@ -395,16 +391,16 @@ async function main() {
       }
     }
 
-    await pgClient.query('COMMIT');
+    await conn.commit();
     log(`Inserted ${inserted} rows${errors > 0 ? `, skipped ${errors} with errors` : ''}`);
     log(`=== Sync complete for ${syncDate} ===`);
 
   } catch (err) {
     log(`FATAL: ${err.message}`);
-    try { await pgClient.query('ROLLBACK'); } catch (_) {}
+    try { await conn.rollback(); } catch (_) {}
     process.exitCode = 1;
   } finally {
-    try { await pgClient.end(); } catch (_) {}
+    try { await conn.end(); } catch (_) {}
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
   }
 }
